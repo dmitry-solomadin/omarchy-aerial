@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+node "$root/tests/test_library.cjs"
+PYTHONDONTWRITEBYTECODE=1 python3 -I "$root/tests/test_fetch.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -I "$root/tests/test_player.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -I "$root/tests/test_lock.py"

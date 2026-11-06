@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd -- "$(dirname -- "$0")" && pwd)"
+id="io.github.dmitry-solomadin.aerial"
+target="$HOME/.config/omarchy/plugins/$id"
+omarchy plugin validate "$root"
+if [[ -e "$target" || -L "$target" ]]; then
+  [[ "$(readlink -f "$target")" == "$root" ]] || { echo "Already installed at $target; move it aside first." >&2; exit 1; }
+else
+  mkdir -p "$(dirname "$target")"
+  ln -s "$root" "$target"
+fi
+omarchy-shell shell rescanPlugins >/dev/null
+# The rescan finishes in the background, so wait until the shell knows the plugin.
+for _ in {1..50}; do
+  omarchy plugin list | grep -q "^$id " && break
+  sleep 0.1
+done
+omarchy plugin enable "$id"
+"$root/bin/aerial" install

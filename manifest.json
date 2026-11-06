@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.dmitry-solomadin.aerial",
+  "name": "Aerial",
+  "version": "0.2.0",
+  "author": "dmitry-solomadin",
+  "license": "MIT",
+  "description": "An Apple TV style aerial video screensaver. Choose and download clips, keep one or cycle through them.",
+  "kinds": ["service"],
+  "entryPoints": {"service": "qml/Service.qml"}
+}

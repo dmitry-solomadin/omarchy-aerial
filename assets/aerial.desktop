@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Aerial
+Comment=Choose and download clips for the aerial screensaver
+Exec=omarchy-shell io.github.dmitry-solomadin.aerial open
+Icon=io.github.dmitry-solomadin.aerial
+Terminal=false
+Categories=Settings;Utility;
+Keywords=screensaver;aerial;apple;video;
+StartupNotify=false

@@ -1,0 +1,440 @@
+#!/bin/bash
+
+# aerial: Apple-style aerial video screensaver for Omarchy.
+
+set -uo pipefail
+
+ROOT=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/aerial"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/aerial"
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/aerial/aerial.conf"
+SHIM_DIR="$DATA/shim"
+BASH_PROFILE="$HOME/.bash_profile"
+BINDINGS="$HOME/.config/hypr/bindings.lua"
+STOCK_LAUNCHER=/usr/bin/omarchy-launch-screensaver
+
+PROFILE_BEGIN="# >>> aerial screensaver >>>"
+PROFILE_END="# <<< aerial screensaver <<<"
+BINDINGS_BEGIN="-- >>> aerial screensaver"
+BINDINGS_END="-- <<< aerial screensaver"
+
+usage() {
+  cat <<USAGE
+Usage: aerial <command>
+
+  open              Open the settings app
+  start [force] [--clip FILE]
+                    Start the screensaver now. force ignores the Omarchy toggle,
+                    and --clip previews one downloaded clip
+  fetch [--budget 20G | --all | --clip FILE] [--jobs N] [--dry-run]
+                    Download clips from Apple
+  install           Use aerial as the Omarchy screensaver and add its shortcuts
+  uninstall         Go back to the stock screensaver, keeping downloaded clips
+  status            Show what is installed and downloaded
+  lock status|on|off|follow FILE|sync
+                    Play clips on the lock screen, where the lock design supports video
+USAGE
+}
+
+clip_count() {
+  find "$DATA/videos" -maxdepth 1 -type f \
+    \( -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' -o -iname '*.mkv' -o -iname '*.webm' \) 2>/dev/null | wc -l
+}
+
+cmd_start() {
+  local mode="" clip="" debug=${AERIAL_DEBUG:-}
+  while (($#)); do
+    case $1 in
+    --clip) clip=${2:-}; shift 2 || shift ;;
+    *) mode=$1; shift ;;
+    esac
+  done
+
+  pgrep -f '[o]rg.omarchy.screensaver' >/dev/null && exit 0
+
+  # The same switch that controls the stock screensaver controls this one.
+  if omarchy-toggle-enabled screensaver-off && [[ $mode != force ]]; then
+    exit 1
+  fi
+
+  # Never leave the machine without a screensaver because of us.
+  if ! command -v mpv >/dev/null || (($(clip_count) == 0)); then
+    exec "$STOCK_LAUNCHER" ${mode:+"$mode"}
+  fi
+
+  mkdir -p "$STATE"
+
+  local focused socket events
+  focused=$(omarchy-hyprland-monitor-focused)
+  socket="$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock"
+
+  # Listen before spawning, so a window that maps quickly can't emit its
+  # openwindow event before we are listening for it.
+  # Its stderr is closed so that it can't hold the caller's pipes open.
+  exec {events}< <(exec socat -U - "UNIX-CONNECT:$socket" 2>/dev/null)
+  local listener=$!
+
+  # A new window maps on whatever monitor is focused at that moment, so wait for
+  # each player to open before moving focus on to the next monitor.
+  wait_for_window() {
+    local line deadline=$((SECONDS + 5))
+    while ((SECONDS < deadline)) && IFS= read -r -t $((deadline - SECONDS)) -u "$events" line; do
+      [[ $line == openwindow\>\>*,org.omarchy.screensaver,* ]] && return 0
+    done
+    return 1
+  }
+
+  focus_monitor() {
+    hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null 2>&1 || hyprctl dispatch focusmonitor "$1" >/dev/null
+  }
+
+  local monitors=() line
+  while IFS= read -r line; do monitors+=("$line"); done < <(hyprctl monitors -j | jq -r '.[] | "\(.name) \(.specialWorkspace.name)"')
+
+  local count=${#monitors[@]} index=0 seed=$((RANDOM * 32768 + RANDOM)) name special workspace command opened=0
+  for line in "${monitors[@]}"; do
+    read -r name special <<<"$line"
+    focus_monitor "$name"
+    # Share a special workspace that is already showing, like the scratchpad, so it is still open afterwards.
+    workspace=${special:-special:screensaver-$name}
+    printf -v command '%q ' "$ROOT/bin/aerial" play --index "$index" --count "$count" --seed "$seed" ${clip:+--clip "$clip"} ${debug:+--debug}
+    # Omarchy's window rule slides the screensaver in. A popin at full size is a plain fade.
+    hyprctl dispatch "hl.dsp.exec_cmd([[[workspace $workspace; animation popin 100%] $command]])" >/dev/null 2>&1 ||
+      hyprctl dispatch exec -- "[workspace $workspace; animation popin 100%]" bash -lc "$command" >/dev/null
+    wait_for_window && opened=1
+    index=$((index + 1))
+  done
+
+  focus_monitor "$focused"
+
+  if ((opened == 0)); then
+    echo "aerial: no player window opened, using the stock screensaver" >&2
+    kill "$listener" 2>/dev/null
+    exec "$STOCK_LAUNCHER" ${mode:+"$mode"}
+  fi
+
+  # Emptying a special workspace focuses its monitor, so the last player to close
+  # would take focus with it. Hand focus back once they are all gone. The class
+  # goes through the environment, since in argv pgrep and pkill would match it.
+  (
+    while hyprctl clients -j | SCREENSAVER=org.omarchy.screensaver jq -e 'any(.[]; .mapped and .class == env.SCREENSAVER)' >/dev/null; do
+      IFS= read -r -u "$events" line || break
+    done
+    focus_monitor "$focused"
+    kill "$listener" 2>/dev/null
+  ) >/dev/null 2>&1 &
+}
+
+# 12 or 24 hours, as the system has it. The shell knows Omarchy's language, which is
+# what its own panels go by, and the system locale stands in when it can't be asked.
+hour_format() {
+  local format
+  format=$(timeout 2 omarchy-shell io.github.dmitry-solomadin.aerial hourFormat 2>/dev/null)
+  if [[ $format == 12h || $format == 24h ]]; then
+    printf '%s' "$format"
+    return 0
+  fi
+  case $(locale t_fmt 2>/dev/null) in
+  *%r* | *%I* | *%l* | *%p* | *%P*) printf 12h ;;
+  *) printf 24h ;;
+  esac
+}
+
+# Runs as the window itself. The app id must stay in mpv's argv: the Omarchy lock
+# command ends the screensaver with pkill -f on it, and the shell's idle service
+# tracks the window by it.
+cmd_play() {
+  local index=0 count=1 seed=0 clip="" extra=()
+  while (($#)); do
+    case $1 in
+    --index) index=$2; shift 2 ;;
+    --count) count=$2; shift 2 ;;
+    --seed) seed=$2; shift 2 ;;
+    --clip) clip=$2; shift 2 ;;
+    --debug)
+      extra+=("--log-file=$STATE/mpv-$index.log" "--input-ipc-server=${XDG_RUNTIME_DIR:-/tmp}/aerial-$index.sock")
+      shift
+      ;;
+    *) shift ;;
+    esac
+  done
+
+  # Options here win over the settings file, which is how a preview overrides it.
+  local script_opts="aerial-data=$DATA,aerial-state=$STATE,aerial-config=$CONFIG,aerial-index=$index,aerial-count=$count,aerial-seed=$seed"
+  script_opts+=",aerial-cli=$ROOT/bin/aerial,aerial-clock_format=$(hour_format)"
+  [[ -n $clip ]] && script_opts+=",aerial-mode=one,aerial-clip=$clip,aerial-preview=yes"
+
+  exec mpv --config-dir="$ROOT/mpv" \
+    --wayland-app-id=org.omarchy.screensaver \
+    --script-opts="$script_opts" \
+    ${extra[@]+"${extra[@]}"}
+}
+
+# The settings window lives in the Omarchy shell, as a plugin.
+cmd_open() {
+  exec omarchy-shell io.github.dmitry-solomadin.aerial open
+}
+
+write_shim() {
+  mkdir -p "$SHIM_DIR"
+  cat >"$SHIM_DIR/omarchy-launch-screensaver" <<SHIM
+#!/bin/bash
+# Installed by \`aerial install\`. Omarchy's idle service starts the screensaver
+# through a login shell, whose PATH finds this first. Removing it restores stock.
+[[ -x "$ROOT/bin/aerial" ]] && exec "$ROOT/bin/aerial" start "\$@"
+exec $STOCK_LAUNCHER "\$@"
+SHIM
+  chmod +x "$SHIM_DIR/omarchy-launch-screensaver"
+}
+
+remove_profile_lines() {
+  [[ -f $BASH_PROFILE ]] && sed -i "/^$PROFILE_BEGIN\$/,/^$PROFILE_END\$/d" "$BASH_PROFILE"
+}
+
+remove_bindings() {
+  [[ -f $BINDINGS ]] && sed -i "/^$BINDINGS_BEGIN\$/,/^$BINDINGS_END\$/d" "$BINDINGS"
+}
+
+# Hyprland reloads on save, but an error in this file should be reported here.
+validate_bindings() {
+  command -v hyprctl >/dev/null || return 0
+  hyprctl reload >/dev/null 2>&1
+  local errors
+  errors=$(hyprctl configerrors 2>/dev/null)
+  [[ -z ${errors//[[:space:]]/} || $errors == "no errors" ]] || echo "Hyprland reports: $errors" >&2
+}
+
+install_bindings() {
+  [[ -f $BINDINGS ]] || return 0
+  cp "$BINDINGS" "$BINDINGS.bak.$(date +%s)"
+  remove_bindings
+  cat >>"$BINDINGS" <<LUA
+$BINDINGS_BEGIN
+o.bind("SUPER + ALT + A", "Aerial", "omarchy-shell io.github.dmitry-solomadin.aerial open")
+o.bind("SUPER + ALT + Z", "Start screensaver", "$ROOT/bin/aerial start force")
+-- Every Quickshell window shares one class, so this matches the title alone: a
+-- class here would also take the others out of floating workspaces' rules.
+-- Its own size when that fits, and never bigger than the screen it opens on.
+o.window({ title = "^Aerial\$" }, { float = true, center = true, size = "min(window_w,monitor_w*0.9) min(window_h,monitor_h*0.9)" })
+$BINDINGS_END
+LUA
+  validate_bindings
+}
+
+cmd_install() {
+  write_shim
+
+  remove_profile_lines
+  cat >>"$BASH_PROFILE" <<PROFILE
+$PROFILE_BEGIN
+[ -d "\$HOME/.local/share/aerial/shim" ] && PATH="\$HOME/.local/share/aerial/shim:\$PATH"
+$PROFILE_END
+PROFILE
+
+  install_bindings
+
+  mkdir -p "$(dirname "$CONFIG")"
+  mkdir -p "$HOME/.local/bin"
+  # The clock used to be chosen here, and now only turns on and off.
+  [[ -f $CONFIG ]] && sed -i -E 's/^clock=(12h|24h)$/clock=on/; s/^# 12h, 24h or off$/# on or off. 12 or 24 hours follows the system./' "$CONFIG"
+  ln -sf "$ROOT/bin/aerial" "$HOME/.local/bin/aerial"
+  [[ -f $CONFIG ]] || cat >"$CONFIG" <<'SETTINGS'
+# Settings for the aerial screensaver. Read each time it starts, and edited by
+# the Aerial window, which keeps these comments.
+
+# cycle through downloaded clips, or one to loop the clip below
+mode=cycle
+clip=
+
+# Limit cycling to some of Landscapes, Cities, Underwater and Space. Empty means all.
+categories=
+
+# on or off. 12 or 24 hours follows the system.
+clock=on
+
+# Apple's location captions: yes or no
+captions=yes
+
+font=Adwaita Sans
+SETTINGS
+
+  cmd_status
+}
+
+cmd_uninstall() {
+  lock_enabled && lock_off
+  remove_profile_lines
+  remove_bindings
+  validate_bindings
+  rm -rf "${SHIM_DIR:?}"
+  [[ -L $HOME/.local/bin/aerial ]] && rm -f "$HOME/.local/bin/aerial"
+  echo "Back to the stock screensaver, and the shortcuts are gone."
+  echo "Clips are still in $DATA/videos ($(du -sh "$DATA/videos" 2>/dev/null | cut -f1)). Delete that folder to reclaim the space."
+}
+
+cmd_status() {
+  local resolved
+  resolved=$(bash -lc 'command -v omarchy-launch-screensaver' 2>/dev/null)
+  if [[ $resolved == "$SHIM_DIR/"* ]]; then
+    echo "Installed: yes, Omarchy's idle service starts aerial"
+  else
+    echo "Installed: no, Omarchy's idle service starts $resolved"
+  fi
+  echo "Clips:     $(clip_count) in $DATA/videos ($(du -sh "$DATA/videos" 2>/dev/null | cut -f1))"
+  echo "Settings:  $CONFIG"
+}
+
+# ---- The lock screen. Only a lock screen may draw while the session is locked, so
+# clips reach it through the video setting of a lock that has one, currently Lock
+# Screen Explorer. "On" isn't stored anywhere: it means the lock's video is one of
+# ours, so a video chosen in Explorer is never overwritten and can't fall out of step.
+
+lock_ipc() {
+  timeout 3 omarchy-shell lock "$@" 2>/dev/null
+}
+
+lock_video() {
+  local video
+  video=$(lock_ipc video) || return 1
+  [[ $video == none ]] && video=""
+  printf '%s' "$video"
+}
+
+lock_enabled() {
+  local video
+  video=$(lock_video) || return 1
+  [[ $video == "$DATA/videos/"* ]]
+}
+
+# The source of a design, or nothing. Designs of the user's own are named after
+# their file with a my- prefix, and the built-in ones after theirs.
+lock_design_file() {
+  local id=$1 file name
+  for file in "$HOME/.config/omarchy/lock-designs/"*.qml; do
+    [[ -f $file ]] || continue
+    name=$(basename "$file" .qml)
+    name=$(printf '%s' "${name,,}" | sed -E 's/[^a-z0-9]+/-/g')
+    [[ "my-$name" == "$id" ]] && { printf '%s' "$file"; return 0; }
+  done
+  for file in "$HOME/.config/omarchy/plugins/io.github.sirjul1337.lock-explorer/designs/"*.qml; do
+    [[ -f $file ]] || continue
+    name=$(basename "$file" .qml)
+    [[ ${name,,} == "$id" ]] && { printf '%s' "$file"; return 0; }
+  done
+  return 1
+}
+
+config_value() {
+  [[ -f $CONFIG ]] || return 0
+  sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*\$/\\1/p" "$CONFIG" | tail -n 1
+}
+
+# What the lock should show now: the kept clip, else what the screensaver last
+# showed, else the first clip here.
+lock_pick_clip() {
+  local kept recent first
+  kept=$(config_value clip)
+  if [[ $(config_value mode) == one && -n $kept && -f $DATA/videos/$kept ]]; then
+    printf '%s' "$DATA/videos/$kept"
+    return 0
+  fi
+  if [[ -f $STATE/recent ]]; then
+    recent=$(tail -n 1 "$STATE/recent")
+    [[ -n $recent && -f $DATA/videos/$recent ]] && { printf '%s' "$DATA/videos/$recent"; return 0; }
+  fi
+  first=$(find "$DATA/videos" -maxdepth 1 -type f -name '*.mov' 2>/dev/null | sort | head -n 1)
+  [[ -n $first ]] && printf '%s' "$first"
+}
+
+lock_status() {
+  local design="" video="" design_file available=false enabled=false
+  if design=$(lock_ipc design) && [[ $design =~ ^[A-Za-z0-9._-]+$ ]] && video=$(lock_video); then
+    if lock_ipc status | jq -e '.multimedia == true' >/dev/null 2>&1 &&
+      design_file=$(lock_design_file "$design") &&
+      grep -q -E 'VideoWallpaper|lock\.videoUrl|"?type"?: *"video"' "$design_file"; then
+      available=true
+    fi
+    [[ $video == "$DATA/videos/"* ]] && enabled=true
+  else
+    design=""
+  fi
+  jq -cn --arg design "$design" --arg video "$video" --argjson available "$available" --argjson enabled "$enabled" \
+    '{available: $available, enabled: $enabled, design: $design, video: $video}'
+}
+
+lock_on() {
+  local current clip
+  current=$(lock_video) || { echo "aerial: this lock screen can't play video" >&2; return 1; }
+  clip=$(lock_pick_clip)
+  [[ -n $clip ]] || { echo "aerial: no clips downloaded" >&2; return 1; }
+  # Remember a video the user chose, to put back when this is turned off.
+  mkdir -p "$STATE"
+  [[ $current == "$DATA/videos/"* ]] || printf '%s' "$current" >"$STATE/lock-video-before"
+  lock_ipc setVideo "$clip" >/dev/null
+}
+
+lock_off() {
+  local before=""
+  lock_enabled || return 0
+  [[ -f $STATE/lock-video-before ]] && before=$(cat "$STATE/lock-video-before")
+  rm -f "$STATE/lock-video-before"
+  if [[ -n $before && -f $before ]]; then
+    lock_ipc setVideo "$before" >/dev/null
+  else
+    lock_ipc clearVideo >/dev/null
+  fi
+}
+
+# The screensaver moved on to this clip, so the lock follows it.
+lock_follow() {
+  local clip=${1:-}
+  [[ -n $clip && $clip != */* && -f $DATA/videos/$clip ]] || return 0
+  lock_enabled || return 0
+  lock_ipc setVideo "$DATA/videos/$clip" >/dev/null
+}
+
+# After settings or the library change: use the kept clip, keep the current one if
+# it still exists, and let the lock go back when nothing is left to show.
+lock_sync() {
+  local current kept clip
+  lock_enabled || return 0
+  current=$(lock_video)
+  kept=$(config_value clip)
+  if [[ $(config_value mode) == one && -n $kept && -f $DATA/videos/$kept ]]; then
+    clip="$DATA/videos/$kept"
+  elif [[ -f $current ]]; then
+    return 0
+  else
+    clip=$(lock_pick_clip)
+  fi
+  if [[ -z $clip ]]; then
+    lock_off
+  elif [[ $clip != "$current" ]]; then
+    lock_ipc setVideo "$clip" >/dev/null
+  fi
+}
+
+cmd_lock() {
+  case "${1:-}" in
+  status) lock_status ;;
+  on) lock_on ;;
+  off) lock_off ;;
+  follow) lock_follow "${2:-}" ;;
+  sync) lock_sync ;;
+  *) usage >&2; exit 2 ;;
+  esac
+}
+
+case "${1:-}" in
+open) shift; cmd_open "$@" ;;
+lock) shift; cmd_lock "$@" ;;
+hour-format) hour_format; echo ;;
+start) shift; cmd_start "$@" ;;
+play) shift; cmd_play "$@" ;;
+fetch) shift; exec python3 -I "$ROOT/lib/aerial-fetch.py" "$@" ;;
+install) cmd_install ;;
+uninstall) cmd_uninstall ;;
+status) cmd_status ;;
+-h | --help | help) usage ;;
+*) usage >&2; exit 2 ;;
+esac

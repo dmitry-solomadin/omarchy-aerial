@@ -1,0 +1,16 @@
+# One module keeps the shared store unique across all feature folders.
+singleton AerialStore 1.0 stores/AerialStore.qml
+singleton Tone 1.0 stores/Tone.qml
+
+Service 1.0 Service.qml
+AerialWindow 1.0 AerialWindow.qml
+WindowContent 1.0 WindowContent.qml
+SettingsColumn 1.0 SettingsColumn.qml
+ClipCard 1.0 ClipCard.qml
+ClipImage 1.0 ClipImage.qml
+
+ActionButton 1.0 components/ActionButton.qml
+FastWheel 1.0 components/FastWheel.qml
+SectionHeading 1.0 components/SectionHeading.qml
+SegmentedControl 1.0 components/SegmentedControl.qml
+Label 1.0 components/Label.qml

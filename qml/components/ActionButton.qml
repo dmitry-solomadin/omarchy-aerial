@@ -1,0 +1,44 @@
+import QtQuick
+import QtQuick.Controls as Controls
+import qs.Commons
+import qs.Commons as Commons
+import qs.Ui as Ui
+import ".."
+
+Controls.Button {
+    id: root
+    HoverHandler { cursorShape: Qt.PointingHandCursor }
+    property bool selected: false
+    // The main action: the selected colors, but unlike a state it answers to hover.
+    property bool accented: false
+    property string hint: ""
+    property color ink: selected || accented ? Commons.Color.accent : Commons.Color.foreground
+    // On a page header's sky, the same backdrop as the benchmark tiles.
+    property bool backdrop: false
+    implicitHeight: Style.space(34)
+    implicitWidth: label.implicitWidth + Style.space(24)
+    padding: Style.space(10)
+    font.family: Style.font.family
+    font.pixelSize: Style.font.body
+    hoverEnabled: true
+    Ui.PanelToolTip { visible: root.hovered && root.hint !== ""; text: root.hint }
+    Accessible.name: hint || text
+    background: Rectangle {
+        radius: Style.cornerRadius
+        color: root.down ? Util.alpha(Commons.Color.foreground, .16) : root.selected ? Util.alpha(Commons.Color.accent, .12)
+            : root.accented ? Util.alpha(Commons.Color.accent, root.hovered ? .2 : .12)
+            : root.hovered ? (root.backdrop ? Tone.backdropHovered : Util.alpha(Commons.Color.foreground, .07))
+            : root.backdrop ? Tone.backdrop : "transparent"
+    }
+    contentItem: Label {
+        id: label
+        text: root.text
+        color: root.ink
+        font.family: root.font.family
+        font.pixelSize: root.font.pixelSize
+        font.bold: root.selected || root.accented
+        horizontalAlignment: Text.AlignHCenter
+        verticalAlignment: Text.AlignVCenter
+        opacity: root.enabled ? 1 : .4
+    }
+}

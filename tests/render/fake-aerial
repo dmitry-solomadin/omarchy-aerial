@@ -1,0 +1,22 @@
+#!/bin/bash
+# Stands in for bin/aerial during a render. The library and delete commands are the
+# real ones, inside the sandbox. Nothing here reaches the network or starts mpv.
+case "$*" in
+  "lock status")
+    on=false
+    [[ -f $XDG_DATA_HOME/aerial/lock-on ]] && on=true
+    echo '{"available": true, "enabled": '"$on"', "design": "my-motion3", "video": ""}'
+    ;;
+  "lock on") : >"$XDG_DATA_HOME/aerial/lock-on" ;;
+  "lock off") rm -f "$XDG_DATA_HOME/aerial/lock-on" ;;
+  lock*) ;;
+  *--library* | *--delete*) exec "$AERIAL_REAL_CLI" "$@" ;;
+  start*) echo "$*" >>"$XDG_DATA_HOME/aerial/started.log" ;;
+  *--thumbnails* | *--catalog*) ;;
+  *--clip*)
+    name=${*##*--clip }
+    name=${name%% *}
+    echo '{"event": "progress", "clip": "'"$name"'", "bytes": 420, "total": 1000}'
+    exec sleep 300
+    ;;
+esac
